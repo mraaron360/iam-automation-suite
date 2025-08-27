@@ -79,7 +79,3 @@ A simple GitHub Actions workflow runs lint & tests on pushes/PRs.
 
 ---
 
-## What you can say in interviews
-- Built a production‑style lifecycle pipeline (CSV → Okta REST API) with idempotent writes, retry/backoff on 429, logging, and unit tests.
-- Implemented MFA compliance reporting and RBAC group assignment via rules.
-- Containerized the tool and wired CI for repeatable automation.
