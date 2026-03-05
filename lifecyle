@@ -1,0 +1,307 @@
+"""
+lifecycle.py
+Identity Lifecycle Automation — Joiner / Mover / Leaver workflows.
+
+Usage:
+    python -m src.lifecycle onboard  --csv data/users.csv --idp okta [--apply]
+    python -m src.lifecycle offboard --csv data/users.csv --idp okta [--apply]
+    python -m src.lifecycle update   --csv data/users.csv --idp okta [--apply]
+"""
+
+import argparse
+import csv
+import logging
+import os
+import sys
+from datetime import datetime
+from pathlib import Path
+
+from src.config import (
+    GROUP_RULES,
+    FALLBACK_GROUP_ID,
+    DEFAULT_GROUP_ID,
+    HARD_DELETE_ON_OFFBOARD,
+    LOG_DIR,
+    LOG_LEVEL,
+)
+from src.okta_client import OktaClient
+
+# ── Logging setup ─────────────────────────────────────────────────────────────
+Path(LOG_DIR).mkdir(exist_ok=True)
+log_file = os.path.join(LOG_DIR, f"lifecycle_{datetime.now():%Y%m%d_%H%M%S}.log")
+logging.basicConfig(
+    level=getattr(logging, LOG_LEVEL, logging.INFO),
+    format="%(asctime)s [%(levelname)s] %(message)s",
+    handlers=[
+        logging.StreamHandler(sys.stdout),
+        logging.FileHandler(log_file),
+    ],
+)
+logger = logging.getLogger(__name__)
+
+
+# ── CSV helpers ───────────────────────────────────────────────────────────────
+
+REQUIRED_COLUMNS = {"employee_id", "first_name", "last_name", "email", "department", "role", "status"}
+
+
+def load_csv(path: str) -> list[dict]:
+    """Load and validate the users CSV file."""
+    rows = []
+    with open(path, newline="", encoding="utf-8") as f:
+        reader = csv.DictReader(f)
+        missing = REQUIRED_COLUMNS - set(reader.fieldnames or [])
+        if missing:
+            raise ValueError(f"CSV missing required columns: {missing}")
+        for i, row in enumerate(reader, start=2):
+            row = {k.strip(): v.strip() for k, v in row.items()}
+            if not row.get("email"):
+                logger.warning("Row %d: empty email — skipping.", i)
+                continue
+            rows.append(row)
+    logger.info("Loaded %d rows from %s", len(rows), path)
+    return rows
+
+
+# ── Group resolution ──────────────────────────────────────────────────────────
+
+def resolve_groups(department: str, role: str) -> list[str]:
+    """
+    Map (department, role) → list of Okta group IDs.
+    Falls back to FALLBACK_GROUP_ID if no rule matches.
+    """
+    key = (department.lower().strip(), role.lower().strip())
+    groups = GROUP_RULES.get(key, [FALLBACK_GROUP_ID])
+    if DEFAULT_GROUP_ID and DEFAULT_GROUP_ID not in groups:
+        groups = [DEFAULT_GROUP_ID] + groups
+    return groups
+
+
+# ── Onboarding (Joiner) ───────────────────────────────────────────────────────
+
+def onboard_user(client: OktaClient, row: dict, dry_run: bool) -> dict:
+    """
+    Create or reactivate an Okta user and assign groups.
+
+    Returns a result dict with status and any error message.
+    """
+    email = row["email"]
+    result = {"employee_id": row["employee_id"], "email": email, "action": "onboard", "status": None, "error": None}
+
+    try:
+        existing = client.get_user(email)
+
+        if existing:
+            uid = existing["id"]
+            okta_status = existing.get("status", "")
+            if okta_status == "ACTIVE":
+                logger.info("[SKIP] %s already ACTIVE in Okta.", email)
+                result["status"] = "skipped_already_active"
+                return result
+            if okta_status == "DEPROVISIONED":
+                logger.info("[REACTIVATE] %s is DEPROVISIONED — reactivating.", email)
+                if not dry_run:
+                    client._request("POST", f"/users/{uid}/lifecycle/reactivate?sendEmail=true")
+                result["status"] = "reactivated"
+            else:
+                logger.info("[UPDATE] %s exists with status %s — updating profile.", email, okta_status)
+                if not dry_run:
+                    client.update_user(uid, _build_profile(row))
+                result["status"] = "updated"
+        else:
+            logger.info("[CREATE] %s — creating new Okta user.", email)
+            if not dry_run:
+                created = client.create_user(_build_profile(row), activate=True)
+                uid = created["id"]
+                _assign_groups(client, uid, row)
+            result["status"] = "created"
+
+        if dry_run:
+            groups = resolve_groups(row["department"], row["role"])
+            logger.info("[DRY-RUN] Would assign groups: %s", groups)
+            result["status"] = f"dry_run_{result['status'] or 'create'}"
+
+    except Exception as exc:
+        logger.error("[ERROR] Onboarding %s: %s", email, exc)
+        result["status"] = "error"
+        result["error"] = str(exc)
+
+    return result
+
+
+def _build_profile(row: dict) -> dict:
+    return {
+        "firstName":  row["first_name"],
+        "lastName":   row["last_name"],
+        "email":      row["email"],
+        "login":      row["email"],
+        "department": row.get("department", ""),
+        "title":      row.get("role", ""),
+        "employeeNumber": row.get("employee_id", ""),
+    }
+
+
+def _assign_groups(client: OktaClient, user_id: str, row: dict) -> None:
+    groups = resolve_groups(row["department"], row["role"])
+    for gid in groups:
+        try:
+            client.add_user_to_group(user_id, gid)
+        except Exception as e:
+            logger.warning("Could not add %s to group %s: %s", user_id, gid, e)
+
+
+# ── Offboarding (Leaver) ──────────────────────────────────────────────────────
+
+def offboard_user(client: OktaClient, row: dict, dry_run: bool) -> dict:
+    """
+    Deactivate (or hard-delete) a user and revoke their sessions.
+
+    Returns a result dict with status and any error message.
+    """
+    email = row["email"]
+    result = {"employee_id": row["employee_id"], "email": email, "action": "offboard", "status": None, "error": None}
+
+    try:
+        user = client.get_user(email)
+        if not user:
+            logger.warning("[NOT FOUND] %s not in Okta — skipping offboard.", email)
+            result["status"] = "not_found"
+            return result
+
+        uid = user["id"]
+        okta_status = user.get("status", "")
+
+        if okta_status in ("DEPROVISIONED", "DEACTIVATED"):
+            logger.info("[SKIP] %s already %s.", email, okta_status)
+            result["status"] = f"skipped_{okta_status.lower()}"
+            return result
+
+        logger.info("[OFFBOARD] %s (status: %s) — revoking sessions + deactivating.", email, okta_status)
+
+        if not dry_run:
+            client.revoke_user_sessions(uid)
+            if HARD_DELETE_ON_OFFBOARD:
+                client.deprovision_user(uid)
+                result["status"] = "deprovisioned"
+            else:
+                client.deactivate_user(uid)
+                result["status"] = "deactivated"
+        else:
+            action = "deprovision" if HARD_DELETE_ON_OFFBOARD else "deactivate"
+            logger.info("[DRY-RUN] Would %s %s and revoke sessions.", action, email)
+            result["status"] = f"dry_run_{action}"
+
+    except Exception as exc:
+        logger.error("[ERROR] Offboarding %s: %s", email, exc)
+        result["status"] = "error"
+        result["error"] = str(exc)
+
+    return result
+
+
+# ── Mover (profile update) ────────────────────────────────────────────────────
+
+def update_user(client: OktaClient, row: dict, dry_run: bool) -> dict:
+    """
+    Update an existing user's profile and reconcile group memberships.
+    Adds new role groups and removes groups not in the new role profile.
+    """
+    email = row["email"]
+    result = {"employee_id": row["employee_id"], "email": email, "action": "update", "status": None, "error": None}
+
+    try:
+        user = client.get_user(email)
+        if not user:
+            logger.warning("[NOT FOUND] %s — cannot update.", email)
+            result["status"] = "not_found"
+            return result
+
+        uid = user["id"]
+        desired_groups = set(resolve_groups(row["department"], row["role"]))
+        current_groups = {g["id"] for g in client.get_user_groups(uid)}
+
+        to_add    = desired_groups - current_groups
+        to_remove = current_groups - desired_groups
+
+        logger.info("[UPDATE] %s — add groups: %s | remove groups: %s", email, to_add, to_remove)
+
+        if not dry_run:
+            client.update_user(uid, _build_profile(row))
+            for gid in to_add:
+                client.add_user_to_group(uid, gid)
+            for gid in to_remove:
+                client.remove_user_from_group(uid, gid)
+            result["status"] = "updated"
+        else:
+            logger.info("[DRY-RUN] Would update profile and reconcile %d group change(s).", len(to_add) + len(to_remove))
+            result["status"] = "dry_run_update"
+
+    except Exception as exc:
+        logger.error("[ERROR] Updating %s: %s", email, exc)
+        result["status"] = "error"
+        result["error"] = str(exc)
+
+    return result
+
+
+# ── Reporting ─────────────────────────────────────────────────────────────────
+
+def print_summary(results: list[dict]) -> None:
+    from collections import Counter
+    counts = Counter(r["status"] for r in results)
+    errors = [r for r in results if r["status"] == "error"]
+    print("\n── Lifecycle Summary ─────────────────────────────")
+    for status, count in sorted(counts.items()):
+        print(f"  {status:<30} {count}")
+    print(f"  {'TOTAL':<30} {len(results)}")
+    if errors:
+        print("\n── Errors ────────────────────────────────────────")
+        for e in errors:
+            print(f"  {e['email']}: {e['error']}")
+    print("──────────────────────────────────────────────────\n")
+
+
+# ── CLI entrypoint ────────────────────────────────────────────────────────────
+
+def main():
+    parser = argparse.ArgumentParser(description="IAM Identity Lifecycle Automation")
+    parser.add_argument("action", choices=["onboard", "offboard", "update"], help="Lifecycle action to perform")
+    parser.add_argument("--csv",   required=True, help="Path to users CSV file")
+    parser.add_argument("--idp",   default="okta", choices=["okta"], help="Identity provider (default: okta)")
+    parser.add_argument("--apply", action="store_true", help="Apply changes. Without this flag, runs in dry-run mode.")
+    args = parser.parse_args()
+
+    dry_run = not args.apply
+    if dry_run:
+        logger.info("=== DRY-RUN MODE — no changes will be made. Pass --apply to execute. ===")
+    else:
+        logger.warning("=== APPLY MODE — changes WILL be written to Okta. ===")
+
+    rows = load_csv(args.csv)
+    client = OktaClient()
+    results = []
+
+    action_map = {
+        "onboard":  onboard_user,
+        "offboard": offboard_user,
+        "update":   update_user,
+    }
+    fn = action_map[args.action]
+
+    # Filter rows by status for the relevant action
+    if args.action == "onboard":
+        rows = [r for r in rows if r.get("status", "active").lower() == "active"]
+    elif args.action == "offboard":
+        rows = [r for r in rows if r.get("status", "").lower() == "terminated"]
+
+    logger.info("Processing %d user(s) for action: %s", len(rows), args.action)
+
+    for row in rows:
+        result = fn(client, row, dry_run=dry_run)
+        results.append(result)
+
+    print_summary(results)
+
+
+if __name__ == "__main__":
+    main()
